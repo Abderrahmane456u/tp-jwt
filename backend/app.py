@@ -1,12 +1,12 @@
-# app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import jwt
 import datetime
 import os
+from dotenv import load_dotenv
 import bcrypt
 
-
+load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
@@ -14,29 +14,45 @@ SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 ACCESS_TOKEN_EXPIRES_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRES_MIN", 5))
 REFRESH_TOKEN_EXPIRES_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRES_DAYS", 7))
 
-# ---------- Fake DB (hashed passwords) ----------
-# For a real app, utilisez une vraie base de données.
-def hash_pw(plain):
-    return bcrypt.hashpw(plain.encode(), bcrypt.gensalt()).decode()
+# -----------------------
+# Helper bcrypt
+# -----------------------
+def hash_pw(password):
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
+# -----------------------
+# Fake database
+# -----------------------
 USERS = {
-    "admin": {"password": hash_pw("1234"), "role": "admin"},
-    "user":  {"password": hash_pw("pass"), "role": "user"}
+    "admin": {
+        "password": hash_pw("1234"),
+        "role": "admin",
+        "email": "admin@example.com",
+        "permissions": ["read", "write"]
+    },
+    "user": {
+        "password": hash_pw("pass"),
+        "role": "user",
+        "email": "user@example.com",
+        "permissions": ["read"]
+    }
 }
 
-# ---------- Tokens ----------
-def create_access_token(username, role):
+# -----------------------
+# Token creators
+# -----------------------
+def create_access_token(username, role, email, permissions):
     now = datetime.datetime.utcnow()
     payload = {
         "sub": username,
         "role": role,
+        "email": email,
+        "permissions": permissions,
         "iat": now,
         "exp": now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRES_MIN),
         "type": "access"
     }
-    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-    # PyJWT returns str in newer versions; ensure str
-    return token
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 def create_refresh_token(username):
     now = datetime.datetime.utcnow()
@@ -46,10 +62,11 @@ def create_refresh_token(username):
         "exp": now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRES_DAYS),
         "type": "refresh"
     }
-    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-    return token
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
-# ---------- Helpers ----------
+# -----------------------
+# Decode token with error handling
+# -----------------------
 def decode_token(token):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
@@ -59,6 +76,9 @@ def decode_token(token):
     except jwt.InvalidTokenError:
         return None, ("invalid", "Token invalide")
 
+# -----------------------
+# Middleware: require token
+# -----------------------
 def require_token(fn):
     from functools import wraps
     @wraps(fn)
@@ -66,106 +86,127 @@ def require_token(fn):
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Token manquant"}), 401
-        token = auth.split(" ", 1)[1]
+
+        token = auth.split(" ")[1]
         payload, err = decode_token(token)
+
         if err:
-            # err is tuple like ("expired","Token expiré")
-            code, msg = err
-            return jsonify({"error": msg}), 401
-        # attach user info to request
-        request.user = payload
-        # ensure it's an access token
+            return jsonify({"error": err[1]}), 401
+
         if payload.get("type") != "access":
             return jsonify({"error": "Token non autorisé"}), 401
+
+        request.user = payload
         return fn(*args, **kwargs)
     return wrapper
 
-# ---------- Routes ----------
+# -----------------------
+# Routes
+# -----------------------
+
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json or {}
     username = data.get("username")
     password = data.get("password")
-    if not username or not password:
-        return jsonify({"error": "username et password requis"}), 400
 
     user = USERS.get(username)
     if not user:
         return jsonify({"error": "Identifiants invalides"}), 401
 
-    # check bcrypt
     if not bcrypt.checkpw(password.encode(), user["password"].encode()):
         return jsonify({"error": "Identifiants invalides"}), 401
 
-    access_token = create_access_token(username, user["role"])
-    refresh_token = create_refresh_token(username)
+    access = create_access_token(
+        username,
+        user["role"],
+        user["email"],
+        user["permissions"]
+    )
+
+    refresh = create_refresh_token(username)
 
     return jsonify({
-        "access_token": access_token,
-        "refresh_token": refresh_token,
+        "access_token": access,
+        "refresh_token": refresh,
         "user": username,
-        "role": user["role"]
+        "role": user["role"],
+        "email": user["email"]
     })
 
+# -----------------------
+# Protected routes
+# -----------------------
 
 @app.route("/profile", methods=["GET"])
 @require_token
 def profile():
     return jsonify({
         "message": "Profil utilisateur",
-        "user": request.user.get("sub"),
-        "role": request.user.get("role")
+        "user": request.user["sub"],
+        "role": request.user["role"],
+        "email": request.user["email"]
     })
-
 
 @app.route("/me", methods=["GET"])
 @require_token
 def me():
-    # retourne le payload JWT (sub, role, iat, exp, type ...)
     return jsonify(request.user)
-
 
 @app.route("/admin", methods=["GET"])
 @require_token
-def admin_route():
-    if request.user.get("role") != "admin":
-        return jsonify({"error": "Accès refusé – Admin uniquement"}), 403
-    return jsonify({
-        "message": "Bienvenue admin",
-        "user": request.user.get("sub")
-    })
+def admin():
+    if request.user["role"] != "admin":
+        return jsonify({"error": "Accès refusé"}), 403
+    return jsonify({"message": "Bienvenue admin"})
 
+@app.route("/can-write", methods=["GET"])
+@require_token
+def can_write():
+    if "write" in request.user.get("permissions", []):
+        return jsonify({"message": "Permission accordée (write)"}), 200
+    return jsonify({"error": "Permission 'write' requise"}), 403
 
+# -----------------------
+# Public route
+# -----------------------
+@app.route("/public-info", methods=["GET"])
+def public():
+    return jsonify({"message": "Route publique accessible sans token."})
+
+# -----------------------
+# Refresh token
+# -----------------------
 @app.route("/refresh", methods=["POST"])
 def refresh():
     data = request.json or {}
-    refresh_token = data.get("refresh_token")
-    if not refresh_token:
-        return jsonify({"error": "refresh_token requis"}), 400
+    token = data.get("refresh_token")
 
-    payload, err = decode_token(refresh_token)
+    payload, err = decode_token(token)
     if err:
-        code, msg = err
-        return jsonify({"error": msg}), 401
+        return jsonify({"error": err[1]}), 401
 
-    # ensure token is refresh type
-    if payload.get("type") != "refresh":
+    if payload["type"] != "refresh":
         return jsonify({"error": "Token invalide"}), 401
 
-    username = payload.get("sub")
+    username = payload["sub"]
     user = USERS.get(username)
-    if not user:
-        return jsonify({"error": "Utilisateur introuvable"}), 401
 
-    new_access = create_access_token(username, user["role"])
+    new_access = create_access_token(
+        username,
+        user["role"],
+        user["email"],
+        user["permissions"]
+    )
+
     return jsonify({"access_token": new_access})
 
-
-# health
-@app.route("/", methods=["GET"])
+# -----------------------
+# Start
+# -----------------------
+@app.route("/")
 def index():
-    return jsonify({"ok": True, "message": "Backend JWT ready"})
+    return jsonify({"status": "backend ready"})
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(debug=True, port=port)
+    app.run(port=int(os.getenv("PORT", 5000)), debug=True)
