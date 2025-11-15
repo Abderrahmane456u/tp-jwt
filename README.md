@@ -17,4 +17,10 @@ Il inclut :
 ---
 
 ## 📁 Architecture du projet
-
+atelier-jwt/
+├── backend/
+│ ├── app.py
+│ ├── requirements.txt
+│ └── .env
+└── frontend/
+└── index.html
